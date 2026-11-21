@@ -5,3 +5,6 @@ my_notes.txt
 # SQL trace files written by the API server (src/server.js)
 transaction.sql
 query.sql
+
+# Course-server submission script (local only)
+submit.sh
