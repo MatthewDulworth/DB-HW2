@@ -1,3 +1,7 @@
 node_modules/
 my_notes.txt
 .env
+.vscode/
+# SQL trace files written by the API server (src/server.js)
+transaction.sql
+query.sql

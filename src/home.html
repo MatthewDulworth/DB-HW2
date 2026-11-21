@@ -7,10 +7,16 @@
     <link rel="stylesheet" href="home_styles.css">
 
     <style>
+        :root {
+            --sql-panel-width: clamp(320px, 38vw, 640px);
+        }
+
+        /* Leave room on the right for the fixed SQL panel */
         body {
             display: flex;
             place-items: center;
             justify-content: center;
+            padding-right: var(--sql-panel-width);
         }
 
         .tab {
@@ -65,6 +71,80 @@
 
         .display-none {
             display: none;
+        }
+
+        /* SQL panel: fixed full-height sidebar on the right, so it stays put
+           while switching tabs; every request's statements, newest first */
+        #sql-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: var(--sql-panel-width);
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            padding: 8px 16px 16px;
+            border-left: 1px solid #ccc;
+            background: Canvas;
+        }
+
+        .sql-panel-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .sql-log {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 4px 8px;
+        }
+
+        .sql-log summary {
+            cursor: pointer;
+            font-family: monospace;
+            padding: 2px 0;
+        }
+
+        .sql-log summary.failed {
+            color: #8a1c1c;
+        }
+
+        .sql-log pre {
+            margin: 4px 0 8px 16px;
+            white-space: pre-wrap;
+        }
+
+        .sql-log pre .sql-meta {
+            color: #777;
+        }
+
+        .sql-log pre.sql-error .sql-meta {
+            color: #8a1c1c;
+        }
+
+        /* Narrow screens (phones): no room for a sidebar, so stack it below */
+        @media (max-width: 900px) {
+            body {
+                flex-direction: column;
+                padding-right: 0;
+            }
+
+            #sql-panel {
+                position: static;
+                width: 100%;
+                border-left: none;
+                border-top: 1px solid #ccc;
+                margin-top: 16px;
+            }
+
+            .sql-log {
+                max-height: 400px;
+            }
         }
     </style>
 </head>
@@ -190,6 +270,17 @@
                 <div id="bank-message-box" class="message display-none"></div>
             </div>
         </div>
+
+        <!-- **************************************************
+        // SQL Panel (fixed to the right side, see #sql-panel CSS)
+        *************************************************** -->
+        <div id="sql-panel">
+            <div class="sql-panel-header">
+                <h3>SQL Sent to Server</h3>
+                <button id="sql-clear-btn">Clear</button>
+            </div>
+            <div id="sql-log" class="sql-log">No SQL sent yet.</div>
+        </div>
     </div>
 </body>
 
@@ -230,6 +321,9 @@
     let reportStoreSelect = document.getElementById("report-store-select");
     let reportTitle = document.getElementById("report-title");
     let reportDisplay = document.getElementById("report-display");
+
+    let sqlLog = document.getElementById("sql-log");
+    let sqlClearBtn = document.getElementById("sql-clear-btn");
 
     // ------------------------------------------------------------------------------
     // State 
@@ -453,7 +547,8 @@
             await loadItems();
 
             showMessage(
-                `Transaction #${data.transactionId} complete. Total charged: $${data.total} (${data.paymentMethod}).`,
+                `Transaction #${data.transactionId} complete. Total charged: $${data.total} ` +
+                `(${data.paymentMethod}). Took ${data.elapsedMs} ms.`,
                 'success'
             );
 
@@ -731,7 +826,7 @@
             console.table(items);
             showMessage(
                 `Transaction #${result.transactionId} at ${store.street}, ${store.city}: ` +
-                `${items.length} items, total $${result.total} (${payment}).`,
+                `${items.length} items, total $${result.total} (${payment}). Took ${result.elapsedMs} ms.`,
                 'success'
             );
 
@@ -759,6 +854,55 @@
             new Option('All stores', ''),
             ...options.map(option => option.cloneNode(true))
         );
+    }
+
+    // ------------------------------------------------------------------------------
+    // SQL Panel
+    // ------------------------------------------------------------------------------
+    // Every server response carries { sql: [{ db, sql, ms, error? }], elapsedMs };
+    // postJSON/getJSON hand it here. Checkouts and reports open expanded, lookups
+    // (stores, inventory, accounts) stay collapsed.
+    const SQL_LOG_LIMIT = 50;
+    const MAIN_REQUESTS = ['test-transaction', 'reports/'];
+
+    sqlClearBtn.addEventListener("click", () => sqlLog.replaceChildren('No SQL sent yet.'));
+
+    function logSql(method, endpoint, data) {
+        if (!Array.isArray(data?.sql) || data.sql.length === 0) return;
+
+        const failed = data.success === false || data.sql.some(s => s.error);
+        const count = data.sql.length;
+
+        const entry = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent =
+            `${new Date().toLocaleTimeString()}  ${method} /${endpoint}  ` +
+            `${count} statement${count === 1 ? '' : 's'}, ${data.elapsedMs} ms` +
+            (failed ? `  FAILED${data.message ? `: ${data.message}` : ''}` : '');
+        if (failed) summary.classList.add('failed');
+        entry.appendChild(summary);
+
+        for (const statement of data.sql) {
+            const pre = document.createElement('pre');
+            const meta = document.createElement('span');
+            meta.className = 'sql-meta';
+            meta.textContent = `-- [${statement.db}] ${statement.ms} ms` +
+                (statement.error ? `  ERROR: ${statement.error}` : '') + '\n';
+            pre.append(meta, statement.sql);
+            if (statement.error) pre.classList.add('sql-error');
+            entry.appendChild(pre);
+        }
+
+        // Only the newest main request stays expanded
+        if (MAIN_REQUESTS.some(prefix => endpoint.startsWith(prefix))) {
+            sqlLog.querySelectorAll('details[open]').forEach(d => d.open = false);
+            entry.open = true;
+        }
+
+        if (!sqlLog.querySelector('details')) sqlLog.replaceChildren();
+        sqlLog.prepend(entry);
+        while (sqlLog.children.length > SQL_LOG_LIMIT) sqlLog.lastElementChild.remove();
+        sqlLog.scrollTop = 0;
     }
 
     // ------------------------------------------------------------------------------
@@ -809,12 +953,16 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
-        return await response.json();
+        const data = await response.json();
+        logSql('POST', endpoint, data);
+        return data;
     }
 
     async function getJSON(endpoint) {
         const response = await fetch(`http://localhost:3000/${endpoint}`);
-        return await response.json();
+        const data = await response.json();
+        logSql('GET', endpoint, data);
+        return data;
     }
 </script>
 </html>

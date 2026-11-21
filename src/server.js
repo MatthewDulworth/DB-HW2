@@ -29,6 +29,86 @@ const bankPool = new Pool({
 });
 
 // ------------------------------------------------------------------------------
+// SQL Trace
+// ------------------------------------------------------------------------------
+// Every query runs through a tracer so the GUI's SQL panel can show exactly what
+// each request sent and how long it took. The checkout transaction and the
+// reports are also appended to the transaction.sql and query.sql trace files.
+const TRACE_FILES = {
+    transaction: path.join(__dirname, '..', 'transaction.sql'),
+    query: path.join(__dirname, '..', 'query.sql'),
+};
+
+function createTracer(request) {
+    const statements = [];
+    const started = performance.now();
+
+    return {
+        // Returns an object with the same query() as the pool/client it wraps
+        wrap(target, db) {
+            return {
+                async query(text, params) {
+                    const entry = { db, sql: formatSql(text, params), ms: 0 };
+                    statements.push(entry);
+                    const t0 = performance.now();
+                    try {
+                        return await target.query(text, params);
+                    } catch (error) {
+                        entry.error = error.message;
+                        throw error;
+                    } finally {
+                        entry.ms = roundMs(performance.now() - t0);
+                    }
+                },
+            };
+        },
+
+        // Spread into a JSON response: { sql: [...], elapsedMs }
+        result() {
+            return { sql: statements, elapsedMs: roundMs(performance.now() - started) };
+        },
+
+        // Append this request's statements to a trace file
+        save(file, outcome) {
+            const header = `-- ${new Date().toISOString()}  ${request}  ` +
+                `(${roundMs(performance.now() - started)} ms, ${outcome})`;
+            const body = statements.map(s =>
+                `-- [${s.db}] ${s.ms} ms${s.error ? `  ERROR: ${s.error}` : ''}\n` +
+                (s.sql.endsWith(';') ? s.sql : `${s.sql};`));
+
+            fs.promises.appendFile(TRACE_FILES[file], [header, ...body, '', ''].join('\n'))
+                .catch(error => console.error(`Writing ${file}.sql failed: ${error.message}`));
+        },
+    };
+}
+
+// Readable SQL for the trace: strip the template-literal indentation and
+// substitute the $n parameters with literals
+function formatSql(text, params) {
+    const lines = text.replace(/^\s*\n/, '').trimEnd().split('\n');
+    const indent = Math.min(...lines
+        .filter(line => line.trim())
+        .map(line => line.match(/^ */)[0].length));
+    const sql = lines.map(line => line.slice(indent)).join('\n');
+
+    if (!params) return sql;
+    return sql.replace(/\$(\d+)/g, (match, n) =>
+        n - 1 < params.length ? toSqlLiteral(params[n - 1]) : match);
+}
+
+function toSqlLiteral(value) {
+    if (value === null || value === undefined) return 'NULL';
+    if (Array.isArray(value)) return `ARRAY[${value.map(toSqlLiteral).join(', ')}]`;
+    if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
+    if (typeof value === 'number') return String(value);
+    return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function roundMs(ms) {
+    return Math.round(ms * 100) / 100;
+}
+
+// ------------------------------------------------------------------------------
 // Test Transaction Endpoint
 // ------------------------------------------------------------------------------
 // Endpoint to test a transaction with more than 1 item
@@ -98,17 +178,22 @@ app.post('/test-transaction', async (req, res) => {
         quantity: units / 1000
     })).sort((a, b) => a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0);
 
+    const trace = createTracer('POST /test-transaction');
     let client;
     let bankClient;
+    let storeDb;
+    let bankDb;
     try {
         // Connect to the store database
         client = await supermarketPool.connect();
-        await client.query('BEGIN');
+        storeDb = trace.wrap(client, 'supermarket');
+        await storeDb.query('BEGIN');
 
         // Connect to the bank database for card payments
         if (paymentMethod === 'card') {
             bankClient = await bankPool.connect();
-            await bankClient.query('BEGIN');
+            bankDb = trace.wrap(bankClient, 'bank');
+            await bankDb.query('BEGIN');
         }
 
         const validatedItems = [];
@@ -116,7 +201,7 @@ app.post('/test-transaction', async (req, res) => {
 
         for (const purchasedItem of cart) {
             // Retrieve item information, inventory, and tax rate
-            const storeResult = await client.query(`
+            const storeResult = await storeDb.query(`
                 SELECT
                     inv.price,
                     inv.quantity_in_stock,
@@ -152,7 +237,7 @@ app.post('/test-transaction', async (req, res) => {
             }
 
             // Calculate total price including applicable sales tax
-            const lineResult = await client.query(`
+            const lineResult = await storeDb.query(`
                 SELECT ROUND(
                     $1::NUMERIC * $2::NUMERIC *
                     (1 + CASE WHEN $3::BOOLEAN THEN 0 ELSE $4::NUMERIC END),
@@ -172,7 +257,7 @@ app.post('/test-transaction', async (req, res) => {
         }
 
         // Add lines totals
-        const totalResult = await client.query(`
+        const totalResult = await storeDb.query(`
             SELECT COALESCE(
                 SUM(amount),
                 0
@@ -185,7 +270,7 @@ app.post('/test-transaction', async (req, res) => {
 
         // For card payments, subtract the total from the bank balance
         if (paymentMethod === 'card') {
-            const bankResult = await bankClient.query(`
+            const bankResult = await bankDb.query(`
                 UPDATE account
                 SET balance = balance - $1
                 WHERE account_number = $2
@@ -201,7 +286,7 @@ app.post('/test-transaction', async (req, res) => {
         const account = paymentMethod === 'card' ? accountId : null;
 
         // Create the supermarket transaction record
-        const transactionResult = await client.query(`
+        const transactionResult = await storeDb.query(`
             INSERT INTO store_transaction
                 (store_id, account_id, total_amount, payment_method)
             VALUES ($1, $2, $3, $4)
@@ -212,30 +297,33 @@ app.post('/test-transaction', async (req, res) => {
 
         for (const purchasedItem of validatedItems) {
             // Record the specific item purchased
-            await client.query(`
+            await storeDb.query(`
                 INSERT INTO item_sale
                     (transaction_id, sku, quantity_sold, unit_price)
                 VALUES ($1, $2, $3, $4)
             `, [transactionId, purchasedItem.sku, purchasedItem.quantity, purchasedItem.price]);
 
             // Subtract purchased quantity from store inventory
-            await client.query(`
+            await storeDb.query(`
                 UPDATE inventory
                 SET quantity_in_stock = quantity_in_stock - $1
                 WHERE store_id = $2 AND sku = $3
             `, [purchasedItem.quantity, storeId, purchasedItem.sku]);
         }
 
-        if (bankClient) {
-            await bankClient.query('COMMIT');
+        if (bankDb) {
+            await bankDb.query('COMMIT');
         }
-        await client.query('COMMIT');
+        await storeDb.query('COMMIT');
 
         console.log(`Transaction #${transactionId} at store ${storeId}: ` +
             `${validatedItems.length} items, $${total} (${paymentMethod})`);
 
+        trace.save('transaction', `committed #${transactionId}`);
+
         // Return successful purchase information
         return res.json({
+            ...trace.result(),
             success: true,
             message: 'Transaction successful',
             transactionId: transactionId,
@@ -245,14 +333,16 @@ app.post('/test-transaction', async (req, res) => {
     } catch (error) {
         console.error(`Transaction at store ${storeId} rolled back: ${error.message}`);
 
-        if (client) {
-            await client.query('ROLLBACK').catch(console.error);
+        if (storeDb) {
+            await storeDb.query('ROLLBACK').catch(console.error);
         }
-        if (bankClient) {
-            await bankClient.query('ROLLBACK').catch(console.error);
+        if (bankDb) {
+            await bankDb.query('ROLLBACK').catch(console.error);
         }
+        trace.save('transaction', `rolled back: ${error.message}`);
 
         return res.status(400).json({
+            ...trace.result(),
             success: false,
             message: error.message,
         });
@@ -271,8 +361,11 @@ app.post('/test-transaction', async (req, res) => {
 // ------------------------------------------------------------------------------
 // Retrieve monthly sales data
 app.post('/reports/monthly-sales', async (req, res) => {
+    const trace = createTracer('POST /reports/monthly-sales');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
     try {
-        const result = await supermarketPool.query(`
+        const result = await db.query(`
             SELECT
                 s.store_id,
                 s.street,
@@ -301,13 +394,18 @@ app.post('/reports/monthly-sales', async (req, res) => {
 
         console.log(`Monthly sales report: ${result.rows.length} rows`);
 
+        trace.save('query', `${result.rows.length} rows`);
+
         return res.json({
+            ...trace.result(),
             success: true,
             rows: result.rows
         });
     } catch (error) {
+        trace.save('query', `failed: ${error.message}`);
         console.error(`Monthly sales report failed: ${error.message}`);
         return res.status(500).json({
+            ...trace.result(),
             success: false,
             message: error.message
         });
@@ -337,8 +435,11 @@ app.get('/reports/top-selling-items', async (req, res) => {
         });
     }
 
+    const trace = createTracer('GET /reports/top-selling-items');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
     try {
-        const result = await supermarketPool.query(`
+        const result = await db.query(`
             WITH top_selling AS (
                 SELECT
                     d.department_id,
@@ -372,14 +473,19 @@ app.get('/reports/top-selling-items', async (req, res) => {
         ORDER BY department_name;
         `, [storeId]);
 
+        trace.save('query', `${result.rows.length} rows`);
+
         return res.json({
+            ...trace.result(),
             success: true,
             storeId: storeId,
             items: result.rows
         });
 
     } catch (error) {
+        trace.save('query', `failed: ${error.message}`);
         return res.status(500).json({
+            ...trace.result(),
             success: false,
             message: error.message
         });
@@ -406,8 +512,11 @@ app.post('/reports/low-stock', async (req, res) => {
         return res.status(400).json({ success: false, message: 'Invalid threshold' });
     }
 
+    const trace = createTracer('POST /reports/low-stock');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
     try {
-        const result = await supermarketPool.query(`
+        const result = await db.query(`
             SELECT
                 s.store_id,
                 s.street,
@@ -446,13 +555,18 @@ app.post('/reports/low-stock', async (req, res) => {
         console.log(`Low stock report (store ${storeId ?? 'all'}, < ${threshold}): ` +
             `${result.rows.length} rows`);
 
+        trace.save('query', `${result.rows.length} rows`);
+
         return res.json({
+            ...trace.result(),
             success: true,
             rows: result.rows
         });
     } catch (error) {
+        trace.save('query', `failed: ${error.message}`);
         console.error(`Low stock report failed: ${error.message}`);
         return res.status(500).json({
+            ...trace.result(),
             success: false,
             message: error.message
         });
@@ -464,16 +578,19 @@ app.post('/reports/low-stock', async (req, res) => {
 // Reset Endpoint
 // ------------------------------------------------------------------------------
 app.post('/reset-tables', async (req, res) => {
+    const trace = createTracer('POST /reset-tables');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
     try {
         // Reset the supermarket database
         const ddl = fs.readFileSync(path.join(__dirname, '..', 'ddl', 'ddl.sql'), 'utf8');
-        await supermarketPool.query(ddl);
+        await db.query(ddl);
         console.log('Supermarket tables reset from ddl.sql');
 
-        res.json({ success: true });
+        res.json({ ...trace.result(), success: true });
     } catch (error) {
         console.error(`Supermarket reset failed: ${error.message}`);
-        res.status(500).json({ success: false, message: error.message });
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
     }
 });
 
@@ -481,22 +598,26 @@ app.post('/reset-tables', async (req, res) => {
 // Bank Accounts Endpoint
 // ------------------------------------------------------------------------------
 app.post('/accounts', async (req, res) => {
+    const trace = createTracer('POST /accounts');
+    const db = trace.wrap(bankPool, 'bank');
+
     try {
         const queryAccounts = `
             SELECT account_number, balance
             FROM account
             ORDER BY account_number;
         `;
-        const accounts = await bankPool.query(queryAccounts);
+        const accounts = await db.query(queryAccounts);
         console.log(`Loaded ${accounts.rows.length} bank accounts`);
 
         res.json({
+            ...trace.result(),
             success: true,
             accounts: accounts.rows,
         });
     } catch (error) {
         console.error(`Loading bank accounts failed: ${error.message}`);
-        res.status(500).json({ success: false, message: error.message });
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
     }
 });
 
@@ -504,6 +625,9 @@ app.post('/accounts', async (req, res) => {
 // Stores Endpoint
 // ------------------------------------------------------------------------------
 app.post('/stores', async (req, res) => {
+    const trace = createTracer('POST /stores');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
     try {
         // Get the stores table
         const queryStores = `
@@ -511,16 +635,17 @@ app.post('/stores', async (req, res) => {
             FROM store
             ORDER BY store_id;
         `;
-        const stores = await supermarketPool.query(queryStores);
+        const stores = await db.query(queryStores);
         console.log(`Loaded ${stores.rows.length} stores`);
 
         res.json({
+            ...trace.result(),
             success: true,
             stores: stores.rows,
         });
     } catch (error) {
         console.error(`Loading stores failed: ${error.message}`);
-        res.status(500).json({ success: false, message: error.message });
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
     }
 });
 
@@ -528,22 +653,26 @@ app.post('/stores', async (req, res) => {
 // Bank Reset Endpoint
 // ------------------------------------------------------------------------------
 app.post('/reset-bank', async (req, res) => {
+    const trace = createTracer('POST /reset-bank');
+    const db = trace.wrap(bankPool, 'bank');
+
     try {
         // Reset the bank database
         const ddl = fs.readFileSync(path.join(__dirname, '..', 'ddl', 'bankddl.sql'), 'utf8');
-        await bankPool.query(ddl);
+        await db.query(ddl);
 
         const queryAccounts = `SELECT count(*)::int AS count FROM account;`;
-        const accounts = await bankPool.query(queryAccounts);
+        const accounts = await db.query(queryAccounts);
         console.log(`Bank tables reset from bankddl.sql: ${accounts.rows[0].count} accounts`);
 
         res.json({
+            ...trace.result(),
             success: true,
             accountCount: accounts.rows[0].count,
         });
     } catch (error) {
         console.error(`Bank reset failed: ${error.message}`);
-        res.status(500).json({ success: false, message: error.message });
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
     }
 });
 
@@ -553,6 +682,9 @@ app.post('/reset-bank', async (req, res) => {
 app.post('/inventory', async (req, res) => {
     const { storeID } = req.body;
 
+    const trace = createTracer('POST /inventory');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
     try {
         const queryInventory = `
             SELECT *
@@ -560,16 +692,17 @@ app.post('/inventory', async (req, res) => {
             JOIN item ON inventory.sku = item.sku
             WHERE store_id = $1;
         `;
-        const items = await supermarketPool.query(queryInventory, [storeID]);
+        const items = await db.query(queryInventory, [storeID]);
         console.log(`Loaded ${items.rows.length} inventory items for store ${storeID}`);
 
         res.json({
+            ...trace.result(),
             success: true,
             items: items.rows,
         });
     } catch (error) {
         console.error(`Loading inventory for store ${storeID} failed: ${error.message}`);
-        res.status(500).json({ success: false, message: error.message });
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
     }
 });
 
