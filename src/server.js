@@ -11,12 +11,18 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Up to 20 simultaneous checkouts (the GUI's "Simulate Many Customers" limit)
+// each hold one connection per pool, so they get a connection right away
+// instead of queueing; queueing would also inflate the measured checkout time
+const POOL_SIZE = 20;
+
 const supermarketPool = new Pool({
     user: process.env.DB_USER,
     host: process.env.DB_HOST,
     database: process.env.DB_SUPERMARKET,
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
+    max: POOL_SIZE,
 });
 
 // Configure connection to the separate bank database
@@ -26,6 +32,7 @@ const bankPool = new Pool({
     database: process.env.DB_BANK,
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
+    max: POOL_SIZE,
 });
 
 // ------------------------------------------------------------------------------
@@ -100,7 +107,10 @@ function toSqlLiteral(value) {
     if (value === null || value === undefined) return 'NULL';
     if (Array.isArray(value)) return `ARRAY[${value.map(toSqlLiteral).join(', ')}]`;
     if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
-    if (typeof value === 'number') return String(value);
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? String(value) : `'${value}'::NUMERIC`;
+    }
+    if (value instanceof Date) return `'${value.toISOString()}'::TIMESTAMPTZ`;
     return `'${String(value).replace(/'/g, "''")}'`;
 }
 
@@ -614,7 +624,7 @@ app.post('/reports/recent-transactions', async (req, res) => {
                 t.total_amount
             FROM store_transaction AS t
             JOIN store AS s ON t.store_id = s.store_id
-            JOIN item_sale AS si ON si.transaction_id = t.transaction_id
+            LEFT JOIN item_sale AS si ON si.transaction_id = t.transaction_id
             WHERE t.date_and_time >= now() - make_interval(mins => $1)
               AND ($2::INTEGER IS NULL OR t.store_id = $2)
             GROUP BY t.transaction_id, s.store_id

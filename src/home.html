@@ -159,6 +159,11 @@
 
         <h1>Supermarket Database Simulator </h1>
 
+        <!-- TODO: add the demo video link here once it is uploaded -->
+        <p>
+            <a href="../README.md" target="_blank">README</a>
+        </p>
+
         <!-- **************************************************
         // Tabs
         *************************************************** -->
@@ -916,7 +921,6 @@
     }
 
     // ------------------------------------------------------------------------------
-    // ------------------------------------------------------------------------------
     // Bank Accounts
     // ------------------------------------------------------------------------------
     async function loadAccounts() {
@@ -979,15 +983,23 @@
         abortController = new AbortController();
     });
 
+    // Empty when the bank has no accounts (or its tables were never created), so
+    // simulated customers can still pay cash
     async function loadAccountNumbers(signal) {
-        const bank = await postJSON('accounts', {}, signal);
-        if (!bank.success) throw new Error(bank.message);
-        if (bank.accounts.length === 0) throw new Error('No bank accounts');
-        return bank.accounts.map(a => a.account_number);
+        try {
+            const bank = await postJSON('accounts', {}, signal);
+            if (!bank.success) throw new Error(bank.message);
+            return bank.accounts.map(a => a.account_number);
+        } catch (error) {
+            if (error?.name === 'AbortError') throw error;
+            console.warn(`No bank accounts, simulating cash only: ${error.message}`);
+            return [];
+        }
     }
 
     // One random customer: 10-20 random in-stock items from a random store, paid
-    // by card from a random bank account 70% of the time, otherwise cash.
+    // by card from a random bank account 70% of the time, otherwise cash (always
+    // cash when accountNumbers is empty).
     // Returns the server's checkout response whether it committed or not; throws
     // only when the checkout could not be attempted.
     async function randomCheckout(accountNumbers, signal) {
@@ -1011,7 +1023,7 @@
 
         let paymentMethod = 'cash';
         let accountId;
-        if (Math.random() < 0.7) {
+        if (accountNumbers.length > 0 && Math.random() < 0.7) {
             paymentMethod = 'card';
             accountId = accountNumbers[randomInt(0, accountNumbers.length - 1)];
         }
