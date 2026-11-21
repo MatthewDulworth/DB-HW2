@@ -311,3 +311,35 @@ FROM (
     GROUP BY s.transaction_id
 ) totals
 WHERE t.transaction_id = totals.transaction_id;
+
+
+------------ Indexes ------------
+-- For inventory for a store
+CREATE INDEX idx_inventory_store_sku
+ON inventory(store_id, sku);
+
+-- For items with low stock
+CREATE INDEX idx_inventory_stock
+ON inventory(quantity_in_stock);
+
+-- For recent transactions for all stores
+CREATE INDEX idx_transaction_date
+ON store_transaction(date_and_time DESC);
+
+-- For transactions in one store by date
+CREATE INDEX idx_transaction_store_date
+ON store_transaction(store_id, date_and_time DESC);
+
+-- For sales of a particular item
+CREATE INDEX idx_item_sale_sku
+ON item_sale(sku);
+
+-- For items belonging to a department
+CREATE INDEX idx_item_department
+ON item(department_id);
+
+------------ Update Statistics for Query Planner ------------
+ANALYZE inventory;
+ANALYZE store_transaction;
+ANALYZE item_sale;
+ANALYZE item;
