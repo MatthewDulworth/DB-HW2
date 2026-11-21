@@ -43,7 +43,24 @@ database for card payments.
 
    `DB_SUPERMARKET` and `DB_BANK` must match the database names from step 1.
 
-3. **Install dependencies and start the server:**
+3. **Allow prepared transactions.** Card checkouts use two-phase commit
+   across the two databases, which PostgreSQL disables by default. As a
+   superuser, run this once, then restart PostgreSQL:
+
+   ```sh
+   psql -d postgres -c "ALTER SYSTEM SET max_prepared_transactions = 40;"
+   ```
+
+   With Homebrew, `psql` connects as your macOS user, who is the superuser,
+   and `brew services list` shows the service name to restart (for example
+   `brew services restart postgresql@18`). Other installs use the `postgres`
+   superuser: add `-U postgres`.
+
+   40 covers 20 simultaneous card checkouts, each preparing one transaction
+   in each database. The server prints a warning at startup if the setting
+   is too low, and card checkouts fail until it is fixed (cash still works).
+
+4. **Install dependencies and start the server:**
 
    ```sh
    cd src
@@ -54,10 +71,10 @@ database for card payments.
    It prints `Supermarket API running on http://localhost:3000`. Leave it
    running.
 
-4. **Open `src/home.html`** in a browser (double-click it; no web server is
+5. **Open `src/home.html`** in a browser (double-click it; no web server is
    needed).
 
-5. **Load the data.** On first run the tables do not exist yet:
+6. **Load the data.** On first run the tables do not exist yet:
    - **Supermarket Backend** tab, then **Reset Supermarket Tables**: creates the
      tables from `ddl/ddl.sql` and generates the stores, items, inventory and
      past sales.
@@ -81,10 +98,16 @@ database for card payments.
   with its database and time in milliseconds, newest first. Checkouts show
   the full transaction, including `ROLLBACK` when one fails.
 
-Every checkout runs as a single transaction across both databases: it locks
-the inventory rows, records the sale and its line items, decrements stock and
-charges the bank account, and rolls everything back if any step fails (for
-example, insufficient funds or not enough stock).
+Every checkout is atomic across both databases: it locks the inventory rows,
+records the sale and its line items, decrements stock and charges the bank
+account, and rolls everything back if any step fails (for example,
+insufficient funds or not enough stock). Card checkouts use two-phase commit:
+both databases first `PREPARE TRANSACTION`, and only when both have prepared
+does either `COMMIT PREPARED`, so a failure can never leave a charge without
+a sale or a sale without a charge. If finishing a checkout fails, the server
+keeps retrying it in the background. If the server crashes between the two
+phases, it finishes the leftover prepared transactions when it next starts,
+and refuses card checkouts until it has.
 
 ## Files
 

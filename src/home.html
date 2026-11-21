@@ -625,6 +625,16 @@
                 accountId: Number(accountNumInput.value)
             });
 
+            // Committed (or maybe committed) but not finished yet; the server
+            // finishes it in the background, so the cart is spent either way
+            if (data.committed || data.pending) {
+                cart = [];
+                renderCart();
+                await loadItems();
+                showMessage(data.message, data.committed ? 'success' : 'error');
+                return;
+            }
+
             // Validation failures come back as { error }, transaction failures as { success: false, message }
             if (data.error || !data.success) {
                 throw new Error(data.error ?? data.message);
@@ -1049,7 +1059,30 @@
             const accountNumbers = await loadAccountNumbers(signal);
             const { store, items, payment, result } = await randomCheckout(accountNumbers, signal);
 
-            if (result.error || !result.success) {
+            if (!result.success) {
+                // Committed (or maybe committed) but not finished yet; the
+                // server finishes it in the background. Stock may have changed.
+                if (result.committed || result.pending) {
+                    showMessage(
+                        `Checkout at ${store.street}, ${store.city}: ${result.message} (${payment})`,
+                        result.committed ? 'success' : 'error'
+                    );
+                    await loadItems();
+                    return;
+                }
+
+                // The server ran this checkout and rolled it back as a whole, e.g.
+                // for insufficient funds; nothing was charged or recorded
+                if (result.rolledBack) {
+                    showMessage(
+                        `Checkout at ${store.street}, ${store.city} rolled back: ` +
+                        `${result.message} (${payment}). Nothing was charged or recorded.`
+                    );
+                    return;
+                }
+
+                // Rejected before any transaction started (validation, or card
+                // checkouts unavailable)
                 throw new Error(`${result.error ?? result.message} (${payment})`);
             }
 
@@ -1090,6 +1123,7 @@
             started: 0,
             committed: 0,
             rolledBack: 0,
+            pending: 0,                // outcome not known yet when the server replied
             errors: 0,
             revenue: 0,
             transactionMs: [],         // server-measured time of each committed checkout
@@ -1116,8 +1150,21 @@
                         stats.committed++;
                         stats.revenue += Number(result.total);
                         stats.transactionMs.push(result.elapsedMs);
-                    } else {
+                    } else if (result.committed) {
+                        // Committed; the server finishes it in the background.
+                        // Its time includes the failed finish, so it is left out
+                        // of the transaction times.
+                        stats.committed++;
+                        stats.revenue += Number(result.total);
+                    } else if (result.pending) {
+                        // Not yet known whether it committed; the server decides
+                        stats.pending++;
+                    } else if (result.rolledBack) {
                         stats.rolledBack++;
+                        countReason(result.message);
+                    } else {
+                        // Rejected before any transaction started
+                        stats.errors++;
                         countReason(result.error ?? result.message);
                     }
                 } catch (error) {
@@ -1152,7 +1199,7 @@
     }
 
     function renderBulkStatus(stats, finished, stopped = false) {
-        const done = stats.committed + stats.rolledBack + stats.errors;
+        const done = stats.committed + stats.rolledBack + stats.pending + stats.errors;
         const ms = stats.transactionMs;
         const seconds = (performance.now() - stats.startedAt) / 1000;
 
@@ -1165,6 +1212,8 @@
                 : `Running: ${done} of ${stats.total} customers done.`),
             `${stats.committed} committed ($${stats.revenue.toFixed(2)} in sales), ` +
                 `${stats.rolledBack} rolled back` +
+                (stats.pending ? `, ${stats.pending} pending (the server commits or rolls ` +
+                    `them back as a whole)` : '') +
                 (stats.errors ? `, ${stats.errors} could not start` : '') + '.',
         ];
 

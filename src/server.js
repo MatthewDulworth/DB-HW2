@@ -1,8 +1,9 @@
 const express = require('express');
-const { Pool } = require('pg');
+const { Pool, DatabaseError } = require('pg');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Load DB_* settings from src/.env into process.env
 process.loadEnvFile(path.join(__dirname, '.env'));
@@ -34,6 +35,8 @@ const bankPool = new Pool({
     port: process.env.DB_PORT,
     max: POOL_SIZE,
 });
+
+const POOLS = { supermarket: supermarketPool, bank: bankPool };
 
 // ------------------------------------------------------------------------------
 // SQL Trace
@@ -119,6 +122,200 @@ function roundMs(ms) {
 }
 
 // ------------------------------------------------------------------------------
+// Two-Phase Commit
+// ------------------------------------------------------------------------------
+// A card checkout changes two databases, and a plain COMMIT on each cannot be
+// atomic: whichever commits first cannot be undone if the second fails. So card
+// checkouts use PostgreSQL's two-phase commit:
+//
+//   Phase 1: PREPARE TRANSACTION on the bank, then on the store. A prepared
+//            transaction is saved to disk (it survives a crash) and keeps its
+//            locks, but is not visible yet. Any failure here rolls back both.
+//   Phase 2: once both are prepared the decision is commit: COMMIT PREPARED on
+//            the bank, then on the store.
+//
+// Because the bank goes first in both phases, a crash between the steps leaves
+// at most these states, each with one correct outcome (see resolveCheckout):
+//
+//   bank and store prepared -> both promised, so commit both
+//   only store prepared     -> the bank already committed, so commit the store
+//   only bank prepared      -> the store never prepared, so roll the bank back
+//
+// A prepared transaction keeps its row locks until it is finished, so any that
+// a failure leaves behind are finished in the background (resolveLater) rather
+// than waiting for a restart, and checkouts give up on a lock after
+// LOCK_TIMEOUT instead of waiting forever.
+//
+// Requires max_prepared_transactions > 0 on the PostgreSQL server (see README).
+const GID_PREFIX = 'checkout-';
+// checkout-<uuid>-bank / checkout-<uuid>-supermarket
+const GID_PATTERN = /^(checkout-[0-9a-f-]{36})-(bank|supermarket)$/;
+// Each checkout prepares one transaction in each database, and both pools use
+// the same DB_HOST/DB_PORT, so both databases share the server's
+// max_prepared_transactions limit
+const MIN_PREPARED_TRANSACTIONS = POOL_SIZE * 2;
+// A checkout that waits longer than this for a row lock rolls back
+const LOCK_TIMEOUT = '10s';
+// First wait before finishing a leftover prepared transaction; doubles on each
+// failure up to MAX_RETRY_MS
+const RETRY_MS = 5000;
+const MAX_RETRY_MS = 60000;
+
+// One id per checkout. Transaction ids cannot be $n parameters, so they are
+// generated here, never taken from a request.
+function newGid() {
+    return GID_PREFIX + crypto.randomUUID();
+}
+
+// Prepared transaction ids must be unique across the whole PostgreSQL server,
+// and both databases can live on one server, so each database gets its own
+function preparedId(gid, db) {
+    return `${gid}-${db}`;
+}
+
+// True if PostgreSQL answered with an error, so the statement definitely failed.
+// Otherwise the connection failed and the statement may or may not have run.
+function fromServer(error) {
+    return error instanceof DatabaseError;
+}
+
+// COMMIT PREPARED or ROLLBACK PREPARED. Any session can finish a prepared
+// transaction, so if the checkout's own connection fails, retry once on a new one.
+// Returns true if the checkout's connection failed and should be discarded.
+async function finishPrepared(trace, conn, db, gid, action) {
+    const sql = `${action} PREPARED '${preparedId(gid, db)}'`;
+    try {
+        await conn.query(sql);
+        return false;
+    } catch (error) {
+        console.error(`${sql} on ${db} failed (${error.message}); retrying on a new connection`);
+        await trace.wrap(POOLS[db], db).query(sql);
+        return true;
+    }
+}
+
+// Finish one checkout's leftover prepared transactions by the table above.
+// Safe to repeat: a finished transaction is no longer listed.
+async function resolveCheckout(trace, gid) {
+    const isPrepared = async db => {
+        const result = await trace.wrap(POOLS[db], db).query(`
+            SELECT 1
+            FROM pg_prepared_xacts
+            WHERE database = current_database()
+              AND gid = $1
+        `, [preparedId(gid, db)]);
+        return result.rows.length > 0;
+    };
+
+    const bank = await isPrepared('bank');
+    const store = await isPrepared('supermarket');
+
+    if (bank) {
+        const action = store ? 'COMMIT' : 'ROLLBACK';
+        await trace.wrap(bankPool, 'bank').query(`${action} PREPARED '${preparedId(gid, 'bank')}'`);
+        console.log(`Resolved checkout ${gid}: bank ${action}`);
+    }
+    if (store) {
+        await trace.wrap(supermarketPool, 'supermarket')
+            .query(`COMMIT PREPARED '${preparedId(gid, 'supermarket')}'`);
+        console.log(`Resolved checkout ${gid}: supermarket COMMIT`);
+    }
+    return bank || store;
+}
+
+// Checkouts waiting for resolveLater, so each is retried by one timer only
+const pendingCheckouts = new Set();
+
+// Finish a checkout a failure left prepared, retrying until it works. Waits
+// first so that a PREPARE whose reply was lost has finished on the server
+// before resolveCheckout looks for it.
+function resolveLater(gid) {
+    if (pendingCheckouts.has(gid)) return;
+    pendingCheckouts.add(gid);
+
+    const attempt = async delay => {
+        const trace = createTracer(`resolve ${gid}`);
+        try {
+            if (await resolveCheckout(trace, gid)) {
+                trace.save('transaction', `resolved ${gid}`);
+            }
+            pendingCheckouts.delete(gid);
+        } catch (error) {
+            const next = Math.min(delay * 2, MAX_RETRY_MS);
+            console.error(`Finishing checkout ${gid} failed (${error.message}); ` +
+                `retrying in ${next / 1000} s`);
+            trace.save('transaction', `resolving ${gid} failed: ${error.message}`);
+            setTimeout(() => attempt(next), next);
+        }
+    };
+    setTimeout(() => attempt(RETRY_MS), RETRY_MS);
+}
+
+// Card checkouts are refused until startup recovery has run, so a new checkout
+// never waits on locks held by one a crash left prepared
+let recovered = false;
+
+// Finish the checkouts a crash left prepared. Each one is resolved on its own;
+// any that fail are handed to resolveLater. Throws only if the prepared
+// transactions could not be listed.
+async function recoverCheckouts() {
+    const trace = createTracer('startup recovery');
+
+    const preparedIn = async db => {
+        const result = await trace.wrap(POOLS[db], db).query(`
+            SELECT gid
+            FROM pg_prepared_xacts
+            WHERE database = current_database()
+              AND gid LIKE $1
+        `, [`${GID_PREFIX}%`]);
+        // Only ids this server could have made, since they go into the SQL text.
+        // Returns the checkout ids (without the database suffix).
+        return result.rows
+            .map(r => r.gid.match(GID_PATTERN))
+            .filter(match => match && match[2] === db)
+            .map(match => match[1]);
+    };
+
+    const gids = new Set([...await preparedIn('bank'), ...await preparedIn('supermarket')]);
+
+    for (const gid of gids) {
+        try {
+            await resolveCheckout(trace, gid);
+        } catch (error) {
+            console.error(`Recovering checkout ${gid} failed (${error.message}); retrying in the background`);
+            resolveLater(gid);
+        }
+    }
+
+    if (gids.size > 0) {
+        trace.save('transaction', `recovered ${gids.size} checkouts`);
+    }
+}
+
+// Card checkouts fail with "prepared transactions are disabled" until the
+// server allows them, so say so at startup. Checks both databases in case
+// DB_BANK is ever pointed at a different server.
+async function checkPreparedTransactions() {
+    for (const [db, pool] of Object.entries(POOLS)) {
+        try {
+            const result = await pool.query('SHOW max_prepared_transactions');
+            const limit = Number(result.rows[0].max_prepared_transactions);
+
+            if (limit === 0) {
+                console.warn(`WARNING: max_prepared_transactions is 0 on the ${db} database's ` +
+                    'server, so card checkouts (two-phase commit) will fail. See README setup.');
+            } else if (limit < MIN_PREPARED_TRANSACTIONS) {
+                console.warn(`WARNING: max_prepared_transactions is ${limit} on the ${db} ` +
+                    `database's server; ${MIN_PREPARED_TRANSACTIONS} is needed for ` +
+                    `${POOL_SIZE} simultaneous card checkouts.`);
+            }
+        } catch (error) {
+            console.error(`Checking max_prepared_transactions on ${db} failed: ${error.message}`);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------
 // Test Transaction Endpoint
 // ------------------------------------------------------------------------------
 // Endpoint to test a transaction with more than 1 item
@@ -188,22 +385,42 @@ app.post('/test-transaction', async (req, res) => {
         quantity: units / 1000
     })).sort((a, b) => a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0);
 
+    if (paymentMethod === 'card' && !recovered) {
+        return res.status(503).json({
+            success: false,
+            message: 'Card checkouts are unavailable until the server finishes checkouts ' +
+                'left over from before it started. Try again shortly, or pay cash.',
+        });
+    }
+
     const trace = createTracer('POST /test-transaction');
     let client;
     let bankClient;
     let storeDb;
     let bankDb;
+    let gid;
+    let bankPrepared = false;
+    let storePrepared = false;        // true once the decision is commit
+    // A PREPARE's reply was lost, so it may or may not have happened
+    let bankMaybePrepared = false;
+    let storeMaybePrepared = false;
+    // Connections that failed go back to the pool destroyed, not reused
+    let discardStore = false;
+    let discardBank = false;
+    let receipt;                      // for the response if phase 2 fails
     try {
         // Connect to the store database
         client = await supermarketPool.connect();
         storeDb = trace.wrap(client, 'supermarket');
         await storeDb.query('BEGIN');
+        await storeDb.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
 
         // Connect to the bank database for card payments
         if (paymentMethod === 'card') {
             bankClient = await bankPool.connect();
             bankDb = trace.wrap(bankClient, 'bank');
             await bankDb.query('BEGIN');
+            await bankDb.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
         }
 
         const validatedItems = [];
@@ -322,9 +539,35 @@ app.post('/test-transaction', async (req, res) => {
         }
 
         if (bankDb) {
-            await bankDb.query('COMMIT');
+            // Card: two-phase commit across both databases (see Two-Phase Commit)
+            gid = newGid();
+            receipt = { transactionId, total, paymentMethod };
+
+            // Phase 1: both databases promise they can commit. If a PREPARE's
+            // reply is lost, it may have happened: the catch leaves that to
+            // resolveLater instead of guessing.
+            try {
+                await bankDb.query(`PREPARE TRANSACTION '${preparedId(gid, 'bank')}'`);
+            } catch (error) {
+                bankMaybePrepared = discardBank = !fromServer(error);
+                throw error;
+            }
+            bankPrepared = true;
+            try {
+                await storeDb.query(`PREPARE TRANSACTION '${preparedId(gid, 'supermarket')}'`);
+            } catch (error) {
+                storeMaybePrepared = discardStore = !fromServer(error);
+                throw error;
+            }
+            storePrepared = true;
+
+            // Phase 2: commit both, bank first
+            discardBank = await finishPrepared(trace, bankDb, 'bank', gid, 'COMMIT');
+            discardStore = await finishPrepared(trace, storeDb, 'supermarket', gid, 'COMMIT');
+        } else {
+            // Cash: only the store database changes, so a plain COMMIT is atomic
+            await storeDb.query('COMMIT');
         }
-        await storeDb.query('COMMIT');
 
         console.log(`Transaction #${transactionId} at store ${storeId}: ` +
             `${validatedItems.length} items, $${total} (${paymentMethod})`);
@@ -341,27 +584,89 @@ app.post('/test-transaction', async (req, res) => {
             paymentMethod: paymentMethod,
         });
     } catch (error) {
+        // Both databases promised to commit, so the checkout is committed; only
+        // phase 2 failed, and resolveLater finishes it in the background
+        if (storePrepared) {
+            console.error(`Checkout ${gid} at store ${storeId} committed, but finishing ` +
+                `it failed: ${error.message}`);
+            trace.save('transaction', `committed, finish pending (${gid}): ${error.message}`);
+            discardStore = discardBank = true;
+            resolveLater(gid);
+
+            return res.status(500).json({
+                ...trace.result(),
+                ...receipt,
+                success: false,
+                committed: true,
+                message: `The checkout was committed, but finishing it failed ` +
+                    `(${error.message}). The server will finish it in the background.`,
+            });
+        }
+
+        // The bank prepared but the store's PREPARE reply was lost, so the
+        // checkout may or may not be committed. The bank stays prepared, and
+        // resolveLater commits both if the store did prepare, else rolls back.
+        if (storeMaybePrepared) {
+            console.error(`Checkout ${gid} at store ${storeId}: store PREPARE outcome ` +
+                `unknown (${error.message}); resolving in the background`);
+            trace.save('transaction', `outcome pending (${gid}): ${error.message}`);
+            resolveLater(gid);
+
+            return res.status(500).json({
+                ...trace.result(),
+                ...receipt,
+                success: false,
+                pending: true,
+                message: `The connection failed while committing (${error.message}), so it ` +
+                    `is not yet known whether the checkout went through. The server will ` +
+                    `commit or roll it back as a whole within a few seconds.`,
+            });
+        }
+
         console.error(`Transaction at store ${storeId} rolled back: ${error.message}`);
 
-        if (storeDb) {
-            await storeDb.query('ROLLBACK').catch(console.error);
+        // A failed PREPARE has already rolled its transaction back, and then this
+        // ROLLBACK is a harmless no-op. A failed ROLLBACK means the connection is
+        // broken, and closing it rolls the transaction back.
+        if (storeDb && !discardStore) {
+            await storeDb.query('ROLLBACK').catch(rollbackError => {
+                console.error(rollbackError);
+                discardStore = true;
+            });
         }
-        if (bankDb) {
-            await bankDb.query('ROLLBACK').catch(console.error);
+        if (bankPrepared) {
+            await finishPrepared(trace, bankDb, 'bank', gid, 'ROLLBACK')
+                .then(failed => { discardBank = failed; })
+                .catch(rollbackError => {
+                    // Still prepared and holding its locks, so keep trying
+                    console.error(rollbackError);
+                    discardBank = true;
+                    resolveLater(gid);
+                });
+        } else if (bankMaybePrepared) {
+            // The store did not prepare, so resolveLater rolls the bank back
+            resolveLater(gid);
+        } else if (bankDb) {
+            await bankDb.query('ROLLBACK').catch(rollbackError => {
+                console.error(rollbackError);
+                discardBank = true;
+            });
         }
         trace.save('transaction', `rolled back: ${error.message}`);
 
         return res.status(400).json({
             ...trace.result(),
             success: false,
+            rolledBack: true,
             message: error.message,
         });
     } finally {
+        // release(true) closes the connection instead of reusing it
         if (client) {
-            client.release();
+            client.release(discardStore);
         }
         if (bankClient) {
-            bankClient.release();
+            bankClient.release(discardBank);
         }
     }
 });
@@ -669,7 +974,6 @@ const TABLES = {
     account:           { db: 'bank',        orderBy: 'account_number' },
 };
 
-const POOLS = { supermarket: supermarketPool, bank: bankPool };
 
 const BROWSE_LIMIT = 10;
 
@@ -922,4 +1226,26 @@ app.post('/inventory', async (req, res) => {
 // ------------------------------------------------------------------------------
 // Start DB
 // ------------------------------------------------------------------------------
-app.listen(3000, () => console.log(`Supermarket API running on http://localhost:3000`));
+// Finish any checkouts a crash left prepared before accepting card checkouts.
+// If the databases are unreachable, start anyway so the GUI can report the
+// errors, and keep retrying recovery; card checkouts are refused until it works.
+async function recoverUntilDone(delay = RETRY_MS) {
+    try {
+        await recoverCheckouts();
+        recovered = true;
+    } catch (error) {
+        const next = Math.min(delay * 2, MAX_RETRY_MS);
+        console.error(`Recovering prepared checkouts failed (${error.message}); card ` +
+            `checkouts are disabled until it succeeds. Retrying in ${delay / 1000} s`);
+        setTimeout(() => recoverUntilDone(next), delay);
+    }
+}
+
+async function start() {
+    await checkPreparedTransactions();
+    await recoverUntilDone();
+
+    app.listen(3000, () => console.log(`Supermarket API running on http://localhost:3000`));
+}
+
+start();
