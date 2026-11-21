@@ -69,6 +69,11 @@
             padding: 6px 12px;
         }
 
+        /* The simulation summary is several lines */
+        #bulk-status {
+            white-space: pre-line;
+        }
+
         .display-none {
             display: none;
         }
@@ -167,6 +172,10 @@
             <button id="bank-tab-btn">
                 Bank
             </button>
+            <!-- Cancels every request in flight and any running simulation -->
+            <button id="stop-btn" title="Stop everything that is running">
+                Stop
+            </button>
         </div>
 
         <div class="content">
@@ -218,6 +227,29 @@
                 <button id="simulate-btn">Simulate Random Checkout</button>
 
                 <div id="message-box" class="message display-none"></div>
+
+                <hr>
+
+                <h3>Simulate Many Customers</h3>
+                <p>
+                    Runs random checkouts like the button above, several at a time.
+                    Each one is its own database transaction on its own connection,
+                    so they compete for the same inventory rows and bank accounts.
+                </p>
+
+                <label>
+                    Customers:
+                    <input type="number" id="bulk-count-input" min="1" max="1000" step="1" value="100">
+                </label>
+
+                <label>
+                    At the same time:
+                    <input type="number" id="bulk-concurrency-input" min="1" max="20" step="1" value="10">
+                </label>
+
+                <button id="bulk-simulate-btn">Run Simulation</button>
+
+                <div id="bulk-status" class="message display-none"></div>
             </div>
     
             <!-- **************************************************
@@ -237,6 +269,19 @@
                     <button id="monthly-sales-btn" data-report="monthlySales">Monthly Sales Report</button>
                     <button id="top-sales-btn" data-report="topSellingItems">Top Selling Item per Department</button>
                     <button id="low-stock-btn" data-report="lowStock">Low Stock Reorder List</button>
+                    <button id="recent-btn" data-report="recentTransactions">Recent Transactions</button>
+                </div>
+
+                <!-- Only shown for reports with windowFilter: true -->
+                <div id="report-window-filter" class="display-none">
+                    <label for="report-window-select">Recorded in the last</label>
+                    <select id="report-window-select">
+                        <option value="5">5 minutes</option>
+                        <option value="60" selected>hour</option>
+                        <option value="1440">24 hours</option>
+                        <option value="10080">7 days</option>
+                        <option value="43200">30 days</option>
+                    </select>
                 </div>
 
                 <!-- Only shown for reports with storeFilter: true -->
@@ -248,8 +293,25 @@
                 </div>
 
                 <div id="report-title"></div>
-                    
+
                 <div id="report-display" class="report-display"></div>
+
+                <hr>
+
+                <h3>Tables</h3>
+
+                <div>
+                    <label>
+                        Table:
+                        <select id="table-select"></select>
+                    </label>
+                    <button id="browse-table-btn">Browse 10 Rows</button>
+                    <button id="clear-table-btn">Delete All Rows</button>
+                </div>
+
+                <div id="table-message-box" class="message display-none"></div>
+
+                <div id="table-display" class="report-display"></div>
 
             </div>
 
@@ -319,8 +381,23 @@
 
     let reportStoreFilter = document.getElementById("report-store-filter");
     let reportStoreSelect = document.getElementById("report-store-select");
+    let reportWindowFilter = document.getElementById("report-window-filter");
+    let reportWindowSelect = document.getElementById("report-window-select");
     let reportTitle = document.getElementById("report-title");
     let reportDisplay = document.getElementById("report-display");
+
+    let tableSelect = document.getElementById("table-select");
+    let browseTableBtn = document.getElementById("browse-table-btn");
+    let clearTableBtn = document.getElementById("clear-table-btn");
+    let tableMessageBox = document.getElementById("table-message-box");
+    let tableDisplay = document.getElementById("table-display");
+
+    let bulkCountInput = document.getElementById("bulk-count-input");
+    let bulkConcurrencyInput = document.getElementById("bulk-concurrency-input");
+    let bulkSimulateBtn = document.getElementById("bulk-simulate-btn");
+    let bulkStatus = document.getElementById("bulk-status");
+
+    let stopBtn = document.getElementById("stop-btn");
 
     let sqlLog = document.getElementById("sql-log");
     let sqlClearBtn = document.getElementById("sql-clear-btn");
@@ -332,6 +409,9 @@
     let inventory = [];
     let cart = [];
 
+    // Replaced each time Stop is pressed; requests use its signal (see postJSON)
+    let abortController = new AbortController();
+
     // ------------------------------------------------------------------------------
     // Setup
     // ------------------------------------------------------------------------------
@@ -340,7 +420,11 @@
     // ------------------------------------------------------------------------------
     // Tab Switching
     // ------------------------------------------------------------------------------
-    backendTabBtn.addEventListener("click", () => switchTab(backendTab));
+    // Row counts change with every checkout, so reload the table list each time
+    backendTabBtn.addEventListener("click", () => {
+        switchTab(backendTab);
+        loadTables();
+    });
     customerTabBtn.addEventListener("click", () => switchTab(customerTab));
     // Balances change with every card checkout, so reload them each time the tab opens
     bankTabBtn.addEventListener("click", () => {
@@ -554,7 +638,7 @@
 
         } catch (error) {
             console.error(error);
-            showMessage(`Checkout failed: ${error.message}`);
+            showMessage(`Checkout ${describeError(error)}`);
         }
     }
 
@@ -572,6 +656,7 @@
 
             clearMessage();
             await loadStores();
+            await loadTables();
 
             showMessage('Supermarket tables reset.', 'success', backendMessageBox);
 
@@ -633,6 +718,25 @@
                 ['Sold (30 days)', r => `${Number(r.sold_last_30_days)}${r.priced_by_weight ? ' lb' : ''}`],
             ],
         },
+        // Shows what checkouts (e.g. a simulation run) just wrote
+        recentTransactions: {
+            title: 'Recent Transactions (newest first, up to 500)',
+            storeFilter: true,
+            windowFilter: true,
+            load: () => postJSON('reports/recent-transactions', {
+                minutes: Number(reportWindowSelect.value),
+                storeId: reportStoreSelect.value ? Number(reportStoreSelect.value) : null,
+            }),
+            rowsKey: 'rows',
+            columns: [
+                ['Time', r => new Date(r.date_and_time).toLocaleString()],
+                ['Transaction', r => `#${r.transaction_id}`],
+                ['Store', r => `${r.street}, ${r.city}, ${r.state_code}`],
+                ['Payment', r => r.payment_method === 'card' ? `card, account ${r.account_id}` : 'cash'],
+                ['Items', r => r.item_count],
+                ['Total', r => money(r.total_amount)],
+            ],
+        },
     };
 
     let currentReport = null;
@@ -646,12 +750,16 @@
             if (currentReport.storeFilter) show(reportStoreFilter);
             else hide(reportStoreFilter);
 
+            if (currentReport.windowFilter) show(reportWindowFilter);
+            else hide(reportWindowFilter);
+
             runReport(currentReport);
         })
     );
 
-    // Picking a store reruns the report that is showing the filter
+    // Changing a filter reruns the report that is showing it
     reportStoreSelect.addEventListener('change', () => runReport(currentReport));
+    reportWindowSelect.addEventListener('change', () => runReport(currentReport));
 
     async function runReport(report) {
         reportTitle.textContent = report.title;
@@ -661,25 +769,28 @@
             const data = await report.load();
             if (!data.success) throw new Error(data.message || data.error);
 
-            renderReport(report, data[report.rowsKey]);
+            const rows = data[report.rowsKey];
+            reportTitle.textContent = `${report.title}: ${rows.length} row${rows.length === 1 ? '' : 's'}`;
+            renderTable(reportDisplay, report.columns, rows);
 
         } catch (error) {
             console.error(error);
             reportDisplay.replaceChildren();
-            showMessage(`${report.title} failed: ${error.message}`, 'error', backendMessageBox);
+            showMessage(`${report.title} ${describeError(error)}`, 'error', backendMessageBox);
         }
     }
 
-    function renderReport(report, rows) {
+    // columns: [[header, row => text], ...]
+    function renderTable(container, columns, rows) {
         if (rows.length === 0) {
-            reportDisplay.replaceChildren('No data.');
+            container.replaceChildren('No data.');
             return;
         }
 
         const table = document.createElement('table');
 
         const headRow = document.createElement('tr');
-        for (const [header] of report.columns) {
+        for (const [header] of columns) {
             const th = document.createElement('th');
             th.textContent = header;
             headRow.appendChild(th);
@@ -690,7 +801,7 @@
         for (const r of rows) {
             const row = document.createElement('tr');
 
-            for (const [, value] of report.columns) {
+            for (const [, value] of columns) {
                 const td = document.createElement('td');
                 td.textContent = value(r);
                 row.appendChild(td);
@@ -699,7 +810,88 @@
         }
         table.appendChild(tbody);
 
-        reportDisplay.replaceChildren(table);
+        container.replaceChildren(table);
+    }
+
+    // ------------------------------------------------------------------------------
+    // Table Browser
+    // ------------------------------------------------------------------------------
+    browseTableBtn.addEventListener("click", () => browseTable());
+    clearTableBtn.addEventListener("click", () => clearTable());
+
+    // Fills the select with every table and its row count, keeping the selection
+    async function loadTables() {
+        try {
+            const data = await postJSON('tables');
+            if (!data.success) throw new Error(data.message);
+
+            const selected = tableSelect.value;
+            tableSelect.replaceChildren(...data.tables.map(t => new Option(
+                `${t.name}${t.db === 'bank' ? ' (bank)' : ''} - ` +
+                    (t.rowCount === null ? 'not created' : `${t.rowCount} rows`),
+                t.name
+            )));
+            if (selected) tableSelect.value = selected;
+
+        } catch (error) {
+            console.error(error);
+            showMessage(`Could not list tables ${describeError(error)}`, 'error', tableMessageBox);
+        }
+    }
+
+    async function browseTable() {
+        const table = tableSelect.value;
+        if (!table) return;
+
+        tableDisplay.replaceChildren('Loading...');
+
+        try {
+            const data = await postJSON('tables/browse', { table });
+            if (!data.success) throw new Error(data.message);
+
+            // Columns come from the rows themselves, since every table differs
+            const columns = Object.keys(data.rows[0] ?? {}).map(key => [key, r => formatCell(r[key])]);
+            renderTable(tableDisplay, columns, data.rows);
+            hide(tableMessageBox);
+
+        } catch (error) {
+            console.error(error);
+            tableDisplay.replaceChildren();
+            showMessage(`Browsing ${table} ${describeError(error)}`, 'error', tableMessageBox);
+        }
+    }
+
+    async function clearTable() {
+        const table = tableSelect.value;
+        if (!table) return;
+
+        if (!confirm(`Delete ALL rows from ${table}? This cannot be undone ` +
+            `(Reset Tables regenerates the data).`)) return;
+
+        try {
+            const data = await postJSON('tables/clear', { table });
+            if (!data.success) throw new Error(data.message);
+
+            showMessage(`Deleted ${data.deleted} rows from ${table}.`, 'success', tableMessageBox);
+            tableDisplay.replaceChildren();
+
+        } catch (error) {
+            console.error(error);
+            showMessage(`Deleting from ${table} ${describeError(error)}`, 'error', tableMessageBox);
+        }
+
+        await loadTables();
+        // Checkout's store and item lists may have just been emptied
+        if (table !== 'account') await loadStores();
+    }
+
+    function formatCell(value) {
+        if (value === null || value === undefined) return 'NULL';
+        // Timestamps arrive as ISO strings
+        if (typeof value === 'string' && /^\d{4}-\d\d-\d\dT/.test(value)) {
+            return new Date(value).toLocaleString();
+        }
+        return String(value);
     }
 
     // ------------------------------------------------------------------------------
@@ -777,47 +969,73 @@
     // Simulation
     // ------------------------------------------------------------------------------
     simulateBtn.addEventListener("click", () => simulateCheckout());
+    bulkSimulateBtn.addEventListener("click", () => simulateManyCheckouts());
 
-    // Checks out 10-20 random in-stock items from a random store,
-    // paid by card from a random bank account 70% of the time, otherwise cash
+    // Cancels every request still waiting on the server and stops a running
+    // simulation from starting more checkouts. A checkout already on the server
+    // still commits or rolls back as a whole, so the database stays consistent.
+    stopBtn.addEventListener("click", () => {
+        abortController.abort();
+        abortController = new AbortController();
+    });
+
+    async function loadAccountNumbers(signal) {
+        const bank = await postJSON('accounts', {}, signal);
+        if (!bank.success) throw new Error(bank.message);
+        if (bank.accounts.length === 0) throw new Error('No bank accounts');
+        return bank.accounts.map(a => a.account_number);
+    }
+
+    // One random customer: 10-20 random in-stock items from a random store, paid
+    // by card from a random bank account 70% of the time, otherwise cash.
+    // Returns the server's checkout response whether it committed or not; throws
+    // only when the checkout could not be attempted.
+    async function randomCheckout(accountNumbers, signal) {
+        const store = locations[randomInt(0, locations.length - 1)];
+        if (!store) throw new Error('No stores loaded');
+
+        const data = await postJSON('inventory', { storeID: store.store_id }, signal);
+        if (!data.success) throw new Error(data.message);
+
+        const inStock = data.items.filter(i => Number(i.quantity_in_stock) >= (i.priced_by_weight ? 0.001 : 1));
+        const count = Math.min(randomInt(10, 20), inStock.length);
+        if (count === 0) throw new Error(`Store ${store.store_id} has no items in stock`);
+
+        const items = shuffle(inStock).slice(0, count).map(i => {
+            const stock = Number(i.quantity_in_stock);
+            const quantity = i.priced_by_weight
+                ? Math.min(round(randomInt(100, 3000) / 1000, 3), stock)  // 0.1 - 3 lb
+                : randomInt(1, Math.min(5, Math.floor(stock)));
+            return { sku: i.sku, name: i.name, quantity };
+        });
+
+        let paymentMethod = 'cash';
+        let accountId;
+        if (Math.random() < 0.7) {
+            paymentMethod = 'card';
+            accountId = accountNumbers[randomInt(0, accountNumbers.length - 1)];
+        }
+
+        const result = await postJSON('test-transaction', {
+            storeId: store.store_id,
+            items: items.map(({ sku, quantity }) => ({ sku, quantity })),
+            paymentMethod,
+            accountId,
+        }, signal);
+
+        return {
+            store,
+            items,
+            payment: paymentMethod === 'card' ? `card, account ${accountId}` : 'cash',
+            result,
+        };
+    }
+
     async function simulateCheckout() {
         try {
-            const store = locations[randomInt(0, locations.length - 1)];
-            if (!store) throw new Error('No stores loaded');
-
-            const data = await postJSON('inventory', { storeID: store.store_id });
-            if (!data.success) throw new Error(data.message);
-
-            const inStock = data.items.filter(i => Number(i.quantity_in_stock) >= (i.priced_by_weight ? 0.001 : 1));
-            const count = Math.min(randomInt(10, 20), inStock.length);
-            if (count === 0) throw new Error('Store has no items in stock');
-
-            const items = shuffle(inStock).slice(0, count).map(i => {
-                const stock = Number(i.quantity_in_stock);
-                const quantity = i.priced_by_weight
-                    ? Math.min(round(randomInt(100, 3000) / 1000, 3), stock)  // 0.1 - 3 lb
-                    : randomInt(1, Math.min(5, Math.floor(stock)));
-                return { sku: i.sku, name: i.name, quantity };
-            });
-
-            let paymentMethod = 'cash';
-            let accountId;
-            if (Math.random() < 0.7) {
-                const bank = await postJSON('accounts');
-                if (!bank.success) throw new Error(bank.message);
-                if (bank.accounts.length === 0) throw new Error('No bank accounts');
-
-                paymentMethod = 'card';
-                accountId = bank.accounts[randomInt(0, bank.accounts.length - 1)].account_number;
-            }
-            const payment = paymentMethod === 'card' ? `card, account ${accountId}` : 'cash';
-
-            const result = await postJSON('test-transaction', {
-                storeId: store.store_id,
-                items: items.map(({ sku, quantity }) => ({ sku, quantity })),
-                paymentMethod,
-                accountId,
-            });
+            const signal = abortController.signal;
+            const accountNumbers = await loadAccountNumbers(signal);
+            const { store, items, payment, result } = await randomCheckout(accountNumbers, signal);
 
             if (result.error || !result.success) {
                 throw new Error(`${result.error ?? result.message} (${payment})`);
@@ -835,8 +1053,129 @@
 
         } catch (error) {
             console.error(error);
-            showMessage(`Simulation failed: ${error.message}`);
+            showMessage(`Simulation ${describeError(error)}`);
         }
+    }
+
+    // Many random customers, `concurrency` of them checking out at once. Each
+    // worker starts the next customer as soon as its last one finishes.
+    async function simulateManyCheckouts() {
+        const total = Number(bulkCountInput.value);
+        const concurrency = Number(bulkConcurrencyInput.value);
+
+        if (!bulkCountInput.checkValidity() || !Number.isInteger(total) || total < 1) {
+            showMessage('Customers must be a whole number from 1 to 1000.', 'error', bulkStatus);
+            return;
+        }
+        if (!bulkConcurrencyInput.checkValidity() || !Number.isInteger(concurrency) || concurrency < 1) {
+            showMessage('At the same time must be a whole number from 1 to 20.', 'error', bulkStatus);
+            return;
+        }
+
+        const signal = abortController.signal;
+        const stats = {
+            total,
+            started: 0,
+            committed: 0,
+            rolledBack: 0,
+            errors: 0,
+            revenue: 0,
+            transactionMs: [],         // server-measured time of each committed checkout
+            reasons: new Map(),        // rollback/error reason -> count
+            startedAt: performance.now(),
+        };
+
+        bulkSimulateBtn.disabled = true;
+        showMessage(`Starting ${total} customers, ${concurrency} at a time...`, 'success', bulkStatus);
+
+        const countReason = message => {
+            // "Not enough stock for SKU000012" -> one bucket for all SKUs
+            const reason = String(message).replace(/SKU\d+/g, 'an item');
+            stats.reasons.set(reason, (stats.reasons.get(reason) ?? 0) + 1);
+        };
+
+        const worker = async (accountNumbers) => {
+            while (stats.started < total && !signal.aborted) {
+                stats.started++;
+                try {
+                    const { result } = await randomCheckout(accountNumbers, signal);
+
+                    if (result.success) {
+                        stats.committed++;
+                        stats.revenue += Number(result.total);
+                        stats.transactionMs.push(result.elapsedMs);
+                    } else {
+                        stats.rolledBack++;
+                        countReason(result.error ?? result.message);
+                    }
+                } catch (error) {
+                    // Stopping makes the in-flight requests throw; not a failure
+                    if (signal.aborted) {
+                        stats.started--;
+                        break;
+                    }
+                    console.error(error);
+                    stats.errors++;
+                    countReason(error.message);
+                }
+                renderBulkStatus(stats, false);
+            }
+        };
+
+        try {
+            const accountNumbers = await loadAccountNumbers(signal);
+            const workers = Math.min(concurrency, total);
+            await Promise.all(Array.from({ length: workers }, () => worker(accountNumbers)));
+            renderBulkStatus(stats, true, signal.aborted);
+
+        } catch (error) {
+            console.error(error);
+            showMessage(`Simulation ${describeError(error)}`, 'error', bulkStatus);
+
+        } finally {
+            bulkSimulateBtn.disabled = false;
+            // Stock changed, so refresh the checkout tab's item list
+            await loadItems();
+        }
+    }
+
+    function renderBulkStatus(stats, finished, stopped = false) {
+        const done = stats.committed + stats.rolledBack + stats.errors;
+        const ms = stats.transactionMs;
+        const seconds = (performance.now() - stats.startedAt) / 1000;
+
+        const lines = [
+            (finished
+                ? (stopped
+                    ? `Stopped after ${done} of ${stats.total} customers. Checkouts already ` +
+                      `on the server when Stop was pressed committed or rolled back as a whole.`
+                    : `Finished ${done} customers.`)
+                : `Running: ${done} of ${stats.total} customers done.`),
+            `${stats.committed} committed ($${stats.revenue.toFixed(2)} in sales), ` +
+                `${stats.rolledBack} rolled back` +
+                (stats.errors ? `, ${stats.errors} could not start` : '') + '.',
+        ];
+
+        if (ms.length > 0) {
+            const average = ms.reduce((sum, t) => sum + t, 0) / ms.length;
+            lines.push(`Transaction time: avg ${average.toFixed(1)} ms, ` +
+                `min ${Math.min(...ms)} ms, max ${Math.max(...ms)} ms.`);
+        }
+
+        if (finished && seconds > 0) {
+            lines.push(`Wall time ${seconds.toFixed(1)} s (${(done / seconds).toFixed(1)} checkouts/s).`);
+        }
+
+        for (const [reason, count] of stats.reasons) {
+            lines.push(`  ${count} x ${reason}`);
+        }
+
+        if (finished) {
+            lines.push('See Supermarket Backend > Recent Transactions for the rows written.');
+        }
+
+        const failed = finished && stats.committed === 0 && done > 0;
+        showMessage(lines.join('\n'), failed ? 'error' : 'success', bulkStatus);
     }
 
     function setLocationSelect(data) {
@@ -947,19 +1286,30 @@
         return Math.round(value * factor) / factor;
     }
 
-    async function postJSON(endpoint, body = {}) {
+    // "failed: <reason>", or "stopped." when the Stop button cancelled it
+    function describeError(error) {
+        if (error?.name === 'AbortError') return 'stopped.';
+        if (error instanceof TypeError && /fetch/i.test(error.message)) {
+            return 'failed: cannot reach the server at localhost:3000. Is `npm start` running?';
+        }
+        return `failed: ${error.message}`;
+    }
+
+    // Requests use the current Stop signal unless given one
+    async function postJSON(endpoint, body = {}, signal = abortController.signal) {
         const response = await fetch(`http://localhost:3000/${endpoint}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
+            signal,
         });
         const data = await response.json();
         logSql('POST', endpoint, data);
         return data;
     }
 
-    async function getJSON(endpoint) {
-        const response = await fetch(`http://localhost:3000/${endpoint}`);
+    async function getJSON(endpoint, signal = abortController.signal) {
+        const response = await fetch(`http://localhost:3000/${endpoint}`, { signal });
         const data = await response.json();
         logSql('GET', endpoint, data);
         return data;

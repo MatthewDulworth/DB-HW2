@@ -575,6 +575,209 @@ app.post('/reports/low-stock', async (req, res) => {
 
 
 // ------------------------------------------------------------------------------
+// Recent Transactions
+// ------------------------------------------------------------------------------
+// Checkouts recorded in the last `minutes`, newest first, so the data written by
+// a simulation run can be viewed right after it. Optional storeId limits it to
+// one store.
+const RECENT_TRANSACTIONS_LIMIT = 500;
+
+app.post('/reports/recent-transactions', async (req, res) => {
+    const { minutes = 60, storeId = null } = req.body;
+
+    // Up to one year back
+    if (!Number.isInteger(minutes) || minutes <= 0 || minutes > 525600) {
+        return res.status(400).json({ success: false, message: 'Invalid time window' });
+    }
+
+    if (storeId !== null &&
+        (!Number.isInteger(storeId) || storeId <= 0)) {
+        return res.status(400).json({ success: false, message: 'Invalid store ID' });
+    }
+
+    const trace = createTracer('POST /reports/recent-transactions');
+    const db = trace.wrap(supermarketPool, 'supermarket');
+
+    try {
+        // Grouping by the primary keys lets every other column of t and s be selected
+        const result = await db.query(`
+            SELECT
+                t.transaction_id,
+                t.date_and_time,
+                s.store_id,
+                s.street,
+                s.city,
+                s.state_code,
+                t.payment_method,
+                t.account_id,
+                COUNT(si.sku) AS item_count,
+                t.total_amount
+            FROM store_transaction AS t
+            JOIN store AS s ON t.store_id = s.store_id
+            JOIN item_sale AS si ON si.transaction_id = t.transaction_id
+            WHERE t.date_and_time >= now() - make_interval(mins => $1)
+              AND ($2::INTEGER IS NULL OR t.store_id = $2)
+            GROUP BY t.transaction_id, s.store_id
+            ORDER BY t.date_and_time DESC
+            LIMIT $3;
+        `, [minutes, storeId, RECENT_TRANSACTIONS_LIMIT]);
+
+        console.log(`Recent transactions (last ${minutes} min, store ${storeId ?? 'all'}): ` +
+            `${result.rows.length} rows`);
+
+        trace.save('query', `${result.rows.length} rows`);
+
+        return res.json({
+            ...trace.result(),
+            success: true,
+            rows: result.rows
+        });
+    } catch (error) {
+        trace.save('query', `failed: ${error.message}`);
+        console.error(`Recent transactions report failed: ${error.message}`);
+        return res.status(500).json({
+            ...trace.result(),
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ------------------------------------------------------------------------------
+// Table Browser
+// ------------------------------------------------------------------------------
+// The tables the GUI can browse and empty. Table names cannot be SQL parameters,
+// so only names from this list are ever put into the SQL text.
+const TABLES = {
+    tax:               { db: 'supermarket', orderBy: 'state_code' },
+    department:        { db: 'supermarket', orderBy: 'department_id' },
+    store:             { db: 'supermarket', orderBy: 'store_id' },
+    item:              { db: 'supermarket', orderBy: 'sku' },
+    inventory:         { db: 'supermarket', orderBy: 'store_id, sku' },
+    store_transaction: { db: 'supermarket', orderBy: 'transaction_id DESC' },
+    item_sale:         { db: 'supermarket', orderBy: 'transaction_id DESC, sku' },
+    account:           { db: 'bank',        orderBy: 'account_number' },
+};
+
+const POOLS = { supermarket: supermarketPool, bank: bankPool };
+
+const BROWSE_LIMIT = 10;
+
+function lookupTable(name) {
+    return Object.hasOwn(TABLES, name) ? TABLES[name] : null;
+}
+
+// Every table with its row count (null if it does not exist yet)
+app.post('/tables', async (req, res) => {
+    const trace = createTracer('POST /tables');
+
+    try {
+        const tables = [];
+
+        for (const [db, pool] of Object.entries(POOLS)) {
+            const names = Object.keys(TABLES).filter(name => TABLES[name].db === db);
+
+            // to_regclass is NULL for a missing table, so this works before a reset
+            const existing = await trace.wrap(pool, db).query(`
+                SELECT name
+                FROM UNNEST($1::TEXT[]) AS t(name)
+                WHERE to_regclass(name) IS NOT NULL
+            `, [names]);
+            const present = existing.rows.map(r => r.name);
+
+            const counts = new Map();
+            if (present.length > 0) {
+                const result = await trace.wrap(pool, db).query(
+                    present.map(name =>
+                        `SELECT '${name}' AS name, count(*)::int AS row_count FROM ${name}`
+                    ).join('\nUNION ALL\n'));
+                result.rows.forEach(r => counts.set(r.name, r.row_count));
+            }
+
+            names.forEach(name => tables.push({ name, db, rowCount: counts.get(name) ?? null }));
+        }
+
+        res.json({ ...trace.result(), success: true, tables });
+    } catch (error) {
+        console.error(`Listing tables failed: ${error.message}`);
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
+    }
+});
+
+// The first few rows of one table
+app.post('/tables/browse', async (req, res) => {
+    const { table } = req.body;
+    const config = lookupTable(table);
+
+    if (!config) {
+        return res.status(400).json({ success: false, message: 'Unknown table' });
+    }
+
+    const trace = createTracer('POST /tables/browse');
+    const db = trace.wrap(POOLS[config.db], config.db);
+
+    try {
+        const result = await db.query(`
+            SELECT *
+            FROM ${table}
+            ORDER BY ${config.orderBy}
+            LIMIT $1;
+        `, [BROWSE_LIMIT]);
+
+        res.json({ ...trace.result(), success: true, table, rows: result.rows });
+    } catch (error) {
+        console.error(`Browsing ${table} failed: ${error.message}`);
+        res.status(500).json({ ...trace.result(), success: false, message: error.message });
+    }
+});
+
+// Delete every row of one table, in a transaction. Rows other tables still
+// reference make it fail and roll back, so children must be emptied first.
+app.post('/tables/clear', async (req, res) => {
+    const { table } = req.body;
+    const config = lookupTable(table);
+
+    if (!config) {
+        return res.status(400).json({ success: false, message: 'Unknown table' });
+    }
+
+    const trace = createTracer('POST /tables/clear');
+    let client;
+    let db;
+
+    try {
+        client = await POOLS[config.db].connect();
+        db = trace.wrap(client, config.db);
+
+        await db.query('BEGIN');
+        const result = await db.query(`DELETE FROM ${table};`);
+        await db.query('COMMIT');
+
+        console.log(`Deleted all ${result.rowCount} rows from ${table}`);
+        res.json({ ...trace.result(), success: true, table, deleted: result.rowCount });
+    } catch (error) {
+        if (db) {
+            await db.query('ROLLBACK').catch(console.error);
+        }
+
+        // 23503 = foreign_key_violation; the detail names the referencing table
+        const message = error.code === '23503'
+            ? `Rows in ${table} are still referenced by another table ` +
+              `(${(error.detail ?? error.message).replace(/\.$/, '')}). ` +
+              `Delete that table's rows first.`
+            : error.message;
+
+        console.error(`Deleting rows from ${table} rolled back: ${error.message}`);
+        res.status(error.code === '23503' ? 409 : 500)
+            .json({ ...trace.result(), success: false, message });
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// ------------------------------------------------------------------------------
 // Reset Endpoint
 // ------------------------------------------------------------------------------
 app.post('/reset-tables', async (req, res) => {
