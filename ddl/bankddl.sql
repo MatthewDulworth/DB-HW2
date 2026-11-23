@@ -5,8 +5,18 @@ DROP TABLE IF EXISTS account;
 CREATE TABLE account (
     account_number INTEGER PRIMARY KEY,
     balance NUMERIC(12,2) NOT NULL,
+    account_type VARCHAR(11) NOT NULL DEFAULT 'customer',
 
-    CONSTRAINT nonnegative_balance CHECK (balance >= 0)
+    CONSTRAINT nonnegative_balance CHECK (balance >= 0),
+
+    CONSTRAINT valid_account_type
+        CHECK (account_type IN ('customer', 'supermarket')),
+
+    CONSTRAINT reserved_supermarket_account
+        CHECK (
+            (account_number = 9000) =
+            (account_type = 'supermarket')
+        )
 );
 
 ------------------------------------------------------------
@@ -25,3 +35,15 @@ SELECT
          THEN round((random() * 20)::numeric, 2)
          ELSE round((50 + random() * 4950)::numeric, 2) END
 FROM generate_series(1000, 1299) AS n;
+
+------------ Supermarket Account ------------
+INSERT INTO account (
+    account_number,
+    balance,
+    account_type
+)
+VALUES (
+    9000,
+    0.00,
+    'supermarket'
+);

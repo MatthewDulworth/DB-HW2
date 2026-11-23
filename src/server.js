@@ -38,6 +38,9 @@ const bankPool = new Pool({
 
 const POOLS = { supermarket: supermarketPool, bank: bankPool };
 
+// Shared bank account for the entire supermarket chain
+const SUPERMARKET_ACCOUNT_NUMBER = 9000;
+
 // ------------------------------------------------------------------------------
 // SQL Trace
 // ------------------------------------------------------------------------------
@@ -380,12 +383,18 @@ app.post('/test-transaction', async (req, res) => {
         return res.status(400).json({ error: 'Invalid account ID' });
     }
 
+    if (paymentMethod === 'card' &&
+        accountId === SUPERMARKET_ACCOUNT_NUMBER) {
+        return res.status(400).json({
+            error: 'The supermarket account cannot be used to pay.'
+        });
+    }
     const cart = Array.from(combinedItems, ([sku, units]) => ({
         sku,
         quantity: units / 1000
     })).sort((a, b) => a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0);
 
-    if (paymentMethod === 'card' && !recovered) {
+    if (!recovered) {
         return res.status(503).json({
             success: false,
             message: 'Card checkouts are unavailable until the server finishes checkouts ' +
@@ -415,13 +424,14 @@ app.post('/test-transaction', async (req, res) => {
         await storeDb.query('BEGIN');
         await storeDb.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
 
-        // Connect to the bank database for card payments
-        if (paymentMethod === 'card') {
-            bankClient = await bankPool.connect();
-            bankDb = trace.wrap(bankClient, 'bank');
-            await bankDb.query('BEGIN');
-            await bankDb.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
-        }
+
+        // Both card and cash payments credit the supermarket bank account
+        bankClient = await bankPool.connect();
+        bankDb = trace.wrap(bankClient, 'bank');
+        await bankDb.query('BEGIN');
+        await bankDb.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
+
+        
 
         const validatedItems = [];
         const lineTotals = [];
@@ -496,19 +506,40 @@ app.post('/test-transaction', async (req, res) => {
         const total = totalResult.rows[0].total;
 
         // For card payments, subtract the total from the bank balance
+
+     
+        // Only card payments subtract money from a customer account
         if (paymentMethod === 'card') {
             const bankResult = await bankDb.query(`
                 UPDATE account
                 SET balance = balance - $1
                 WHERE account_number = $2
+                  AND account_type = 'customer'
                   AND balance >= $1
                 RETURNING account_number, balance
             `, [total, accountId]);
 
-            if (bankResult.rows.length === 0) {
-                throw new Error('Insufficient funds or account not found');
+            if (bankResult.rows.length !== 1) {
+                throw new Error(
+                    'Insufficient funds or customer account not found'
+                );
             }
         }
+
+        // Every successful payment credits the supermarket account
+        const supermarketResult = await bankDb.query(`
+            UPDATE account
+            SET balance = balance + $1
+            WHERE account_number = $2
+              AND account_type = 'supermarket'
+            RETURNING account_number, balance
+        `, [total, SUPERMARKET_ACCOUNT_NUMBER]);
+
+        if (supermarketResult.rows.length !== 1) {
+            throw new Error('Supermarket bank account not found');
+        }
+
+
 
         const account = paymentMethod === 'card' ? accountId : null;
 
@@ -964,14 +995,14 @@ app.post('/reports/recent-transactions', async (req, res) => {
 // The tables the GUI can browse and empty. Table names cannot be SQL parameters,
 // so only names from this list are ever put into the SQL text.
 const TABLES = {
-    tax:               { db: 'supermarket', orderBy: 'state_code' },
-    department:        { db: 'supermarket', orderBy: 'department_id' },
-    store:             { db: 'supermarket', orderBy: 'store_id' },
-    item:              { db: 'supermarket', orderBy: 'sku' },
-    inventory:         { db: 'supermarket', orderBy: 'store_id, sku' },
+    tax: { db: 'supermarket', orderBy: 'state_code' },
+    department: { db: 'supermarket', orderBy: 'department_id' },
+    store: { db: 'supermarket', orderBy: 'store_id' },
+    item: { db: 'supermarket', orderBy: 'sku' },
+    inventory: { db: 'supermarket', orderBy: 'store_id, sku' },
     store_transaction: { db: 'supermarket', orderBy: 'transaction_id DESC' },
-    item_sale:         { db: 'supermarket', orderBy: 'transaction_id DESC, sku' },
-    account:           { db: 'bank',        orderBy: 'account_number' },
+    item_sale: { db: 'supermarket', orderBy: 'transaction_id DESC, sku' },
+    account: { db: 'bank', orderBy: 'account_number' },
 };
 
 
@@ -1077,8 +1108,8 @@ app.post('/tables/clear', async (req, res) => {
         // 23503 = foreign_key_violation; the detail names the referencing table
         const message = error.code === '23503'
             ? `Rows in ${table} are still referenced by another table ` +
-              `(${(error.detail ?? error.message).replace(/\.$/, '')}). ` +
-              `Delete that table's rows first.`
+            `(${(error.detail ?? error.message).replace(/\.$/, '')}). ` +
+            `Delete that table's rows first.`
             : error.message;
 
         console.error(`Deleting rows from ${table} rolled back: ${error.message}`);

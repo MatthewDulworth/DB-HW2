@@ -999,7 +999,9 @@
         try {
             const bank = await postJSON('accounts', {}, signal);
             if (!bank.success) throw new Error(bank.message);
-            return bank.accounts.map(a => a.account_number);
+            return bank.accounts
+                .filter(a => a.account_number !== 9000)
+                .map(a => a.account_number);
         } catch (error) {
             if (error?.name === 'AbortError') throw error;
             console.warn(`No bank accounts, simulating cash only: ${error.message}`);
