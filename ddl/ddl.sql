@@ -63,9 +63,6 @@ CREATE TABLE store_transaction (
     total_amount NUMERIC(10,2) NOT NULL,
     payment_method VARCHAR(4) NOT NULL,
 
-    -- Identifies transactions generated during database initialization
-    is_historical BOOLEAN NOT NULL DEFAULT FALSE,
-
     CONSTRAINT payment_is_card_or_cash CHECK (payment_method IN ('card', 'cash')),
     CONSTRAINT card_must_have_account CHECK((payment_method = 'card') = (account_id IS NOT NULL)),
     CONSTRAINT nonnegative_total_amount CHECK(total_amount >= 0),
@@ -262,13 +259,13 @@ WHERE random() < 0.85;
 
 ------------ Store Transaction ------------
 -- 600 transactions over the past 90 days; total_amount is filled in below
-INSERT INTO store_transaction (store_id, account_id, date_and_time, total_amount, payment_method, is_historical)
+INSERT INTO store_transaction (store_id, account_id, date_and_time, total_amount, payment_method)
 SELECT
     t.store_id,
     CASE WHEN t.pay = 'card' THEN 1000 + floor(random() * 300)::int END,
     now() - random() * interval '90 days',
     0,
-    t.pay, TRUE
+    t.pay
 FROM (
     SELECT
         1 + floor(random() * (SELECT count(*) FROM store))::int AS store_id,

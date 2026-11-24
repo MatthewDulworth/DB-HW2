@@ -1,18 +1,21 @@
 # Supermarket Chain Database Web App
 
-COSC 3380 database web app, team **TODO: team number**. It simulates a
+COSC 3380 database web app, team **25**. It simulates a
 supermarket chain (100+ stores across several states) with a separate bank
-database for card payments.
+database: card payments debit a customer account, and every sale (cash or
+card) credits the supermarket's own account, number 9000.
 
 - **Demo video:** TODO: public link
-- **Report:** `teamXY.pdf` (TODO: rename to match the actual file)
+- **Report:** [`writeup/team25.pdf`](writeup/team25.pdf)
 
 ## Team
 
 | Member | Responsibilities |
 |---|---|
-| Matthew Dulworth | TODO |
-| Javier Puentes Leiva | TODO |
+| Matthew Dulworth | Led the web UI (checkout, back-office, and bank tabs; checkout simulation) |
+| Javier Puentes Leiva | Led the checkout transaction and the project report |
+
+Both members worked on every part of the project (ER design, schema, SQL, backend, testing); the table shows who led each area.
 
 ## Requirements
 
@@ -43,7 +46,7 @@ database for card payments.
 
    `DB_SUPERMARKET` and `DB_BANK` must match the database names from step 1.
 
-3. **Allow prepared transactions.** Card checkouts use two-phase commit
+3. **Allow prepared transactions.** Every checkout uses two-phase commit
    across the two databases, which PostgreSQL disables by default. As a
    superuser, run this once, then restart PostgreSQL:
 
@@ -56,9 +59,9 @@ database for card payments.
    `brew services restart postgresql@18`). Other installs use the `postgres`
    superuser: add `-U postgres`.
 
-   40 covers 20 simultaneous card checkouts, each preparing one transaction
+   40 covers 20 simultaneous checkouts, each preparing one transaction
    in each database. The server prints a warning at startup if the setting
-   is too low, and card checkouts fail until it is fixed (cash still works).
+   is too low, and checkouts (cash and card) fail until it is fixed.
 
 4. **Install dependencies and start the server:**
 
@@ -93,21 +96,22 @@ database for card payments.
 - **Supermarket Backend:** the back office. Monthly sales per store, top-selling
   item per department, and a low-stock reorder list, optionally filtered by
   store.
-- **Bank:** account balances, which drop after each card payment.
+- **Bank:** account balances. Customer balances drop after each card payment;
+  the supermarket account (9000) grows with every sale.
 - **SQL Sent to Server** (right side): every SQL statement each request ran,
   with its database and time in milliseconds, newest first. Checkouts show
   the full transaction, including `ROLLBACK` when one fails.
 
 Every checkout is atomic across both databases: it locks the inventory rows,
-records the sale and its line items, decrements stock and charges the bank
-account, and rolls everything back if any step fails (for example,
-insufficient funds or not enough stock). Card checkouts use two-phase commit:
+records the sale and its line items, decrements stock, charges the customer's
+bank account (card only), credits the supermarket's account, and rolls everything back if any step fails (for example,
+insufficient funds or not enough stock). Every checkout uses two-phase commit:
 both databases first `PREPARE TRANSACTION`, and only when both have prepared
 does either `COMMIT PREPARED`, so a failure can never leave a charge without
 a sale or a sale without a charge. If finishing a checkout fails, the server
 keeps retrying it in the background. If the server crashes between the two
 phases, it finishes the leftover prepared transactions when it next starts,
-and refuses card checkouts until it has.
+and refuses checkouts until it has.
 
 ## Files
 

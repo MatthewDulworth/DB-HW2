@@ -8,3 +8,12 @@ query.sql
 
 # Course-server submission script (local only)
 submit.sh
+
+# LaTeX build output (writeup/team25.pdf, built from team25.tex, is committed)
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc

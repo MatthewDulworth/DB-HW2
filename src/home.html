@@ -993,8 +993,9 @@
         abortController = new AbortController();
     });
 
-    // Empty when the bank has no accounts (or its tables were never created), so
-    // simulated customers can still pay cash
+    // Customer account numbers (the supermarket's own account 9000 is excluded).
+    // Empty when the bank has no customer accounts, so simulated customers pay
+    // cash; cash checkouts still need the bank to credit account 9000.
     async function loadAccountNumbers(signal) {
         try {
             const bank = await postJSON('accounts', {}, signal);

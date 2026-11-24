@@ -254,7 +254,7 @@ function resolveLater(gid) {
     setTimeout(() => attempt(RETRY_MS), RETRY_MS);
 }
 
-// Card checkouts are refused until startup recovery has run, so a new checkout
+// Checkouts are refused until startup recovery has run, so a new checkout
 // never waits on locks held by one a crash left prepared
 let recovered = false;
 
@@ -295,7 +295,7 @@ async function recoverCheckouts() {
     }
 }
 
-// Card checkouts fail with "prepared transactions are disabled" until the
+// Checkouts fail with "prepared transactions are disabled" until the
 // server allows them, so say so at startup. Checks both databases in case
 // DB_BANK is ever pointed at a different server.
 async function checkPreparedTransactions() {
@@ -306,11 +306,11 @@ async function checkPreparedTransactions() {
 
             if (limit === 0) {
                 console.warn(`WARNING: max_prepared_transactions is 0 on the ${db} database's ` +
-                    'server, so card checkouts (two-phase commit) will fail. See README setup.');
+                    'server, so checkouts (two-phase commit) will fail. See README setup.');
             } else if (limit < MIN_PREPARED_TRANSACTIONS) {
                 console.warn(`WARNING: max_prepared_transactions is ${limit} on the ${db} ` +
                     `database's server; ${MIN_PREPARED_TRANSACTIONS} is needed for ` +
-                    `${POOL_SIZE} simultaneous card checkouts.`);
+                    `${POOL_SIZE} simultaneous checkouts.`);
             }
         } catch (error) {
             console.error(`Checking max_prepared_transactions on ${db} failed: ${error.message}`);
@@ -397,8 +397,8 @@ app.post('/test-transaction', async (req, res) => {
     if (!recovered) {
         return res.status(503).json({
             success: false,
-            message: 'Card checkouts are unavailable until the server finishes checkouts ' +
-                'left over from before it started. Try again shortly, or pay cash.',
+            message: 'Checkouts are unavailable until the server finishes checkouts ' +
+                'left over from before it started. Try again shortly.',
         });
     }
 
@@ -1257,9 +1257,9 @@ app.post('/inventory', async (req, res) => {
 // ------------------------------------------------------------------------------
 // Start DB
 // ------------------------------------------------------------------------------
-// Finish any checkouts a crash left prepared before accepting card checkouts.
+// Finish any checkouts a crash left prepared before accepting checkouts.
 // If the databases are unreachable, start anyway so the GUI can report the
-// errors, and keep retrying recovery; card checkouts are refused until it works.
+// errors, and keep retrying recovery; checkouts are refused until it works.
 async function recoverUntilDone(delay = RETRY_MS) {
     try {
         await recoverCheckouts();
