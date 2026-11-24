@@ -5,7 +5,7 @@ supermarket chain (100+ stores across several states) with a separate bank
 database: card payments debit a customer account, and every sale (cash or
 card) credits the supermarket's own account, number 9000.
 
-- **Demo video:** TODO: public link
+- **Demo video:** [Google Drive](https://drive.google.com/file/d/1wZFvN_3aisdbL0o3jDsOzwzHSO17AXgN/view?usp=sharing)
 - **Report:** [`writeup/team25.pdf`](writeup/team25.pdf)
 
 ## Team

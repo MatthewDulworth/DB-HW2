@@ -17,3 +17,6 @@ submit.sh
 *.out
 *.synctex.gz
 *.toc
+
+# Raw and edited demo video files (final video is hosted on Google Drive)
+demo/
